@@ -121,7 +121,7 @@ export interface QQBotChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
-  onAutoRegister?: (jid: string, type: 'c2c' | 'group' | 'channel') => void;
+  onAutoRegister?: (jid: string, senderName: string) => void;
 }
 
 interface QQBotConfig {
@@ -649,9 +649,11 @@ export class QQBotChannel implements Channel {
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectAttempts++;
       try {
+        await this.authenticate();
         await this.connectWebSocket();
       } catch (err) {
         logger.error({ err }, 'QQBot: Reconnection failed');
+        this.scheduleReconnect();
       }
     }, delay);
   }
@@ -878,25 +880,29 @@ async function main(): Promise<void> {
   }
 
   if (QQBOT_APP_ID && QQBOT_CLIENT_SECRET) {
-    const qq = new QQBotChannel(QQBOT_APP_ID, QQBOT_CLIENT_SECRET, QQBOT_SANDBOX, {
+    // QQBot auto-registration: first QQBot chat becomes qqbot-main, others get separate containers
+    const qqbotAutoRegister = (jid: string, senderName: string) => {
+      const hasQQBotMain = Object.values(registeredGroups).some(g => g.folder === 'qqbot-main');
+      const isC2C = jid.startsWith('c2c:');
+      const shortId = senderName.slice(0, 8);
+      const folder = !hasQQBotMain ? 'qqbot-main' : `qqbot-${shortId}`;
+      const name = !hasQQBotMain ? 'QQBot Main' : `QQBot ${isC2C ? 'User' : 'Group'} ${shortId}`;
+      registerGroup(jid, {
+        name,
+        folder,
+        trigger: TRIGGER_WORDS,
+        added_at: new Date().toISOString(),
+        requiresTrigger: isC2C ? false : true,
+      });
+      logger.info({ jid, folder, name }, 'QQBot: Auto-registered chat');
+    };
+
+    const qqbot = new QQBotChannel(QQBOT_APP_ID, QQBOT_CLIENT_SECRET, QQBOT_SANDBOX, {
       ...channelOpts,
-      onAutoRegister: (jid, type) => {
-        const id = jid.split(':')[1] || jid;
-        const shortId = id.slice(0, 8).toLowerCase();
-        const folder = `qq-${type}-${shortId}`;
-        const name = type === 'c2c' ? `QQ ${shortId}` : `QQ ${type} ${shortId}`;
-        registerGroup(jid, {
-          name,
-          folder,
-          trigger: `@${ASSISTANT_NAME}`,
-          added_at: new Date().toISOString(),
-          requiresTrigger: type !== 'c2c', // C2C responds to all, groups require trigger
-        });
-        logger.info({ jid, folder }, 'QQBot: Auto-registered chat');
-      },
+      onAutoRegister: qqbotAutoRegister,
     });
-    channels.push(qq);
-    await qq.connect();
+    channels.push(qqbot);
+    await qqbot.connect();
   }
 
   // Start subsystems
@@ -1025,19 +1031,13 @@ Using `set -a; source .env; set +a` is more robust than `grep | xargs` — it co
 
 QQ chats are automatically registered when the first message arrives. No manual registration needed.
 
-- **C2C (private)**: Auto-registered with `requiresTrigger: false` (responds to all messages)
-- **Group**: Auto-registered with `requiresTrigger: true` (requires @mention)
-- **Channel**: Auto-registered with `requiresTrigger: true`
+- **First chat** (any type): Auto-registered as `qqbot-main` with `requiresTrigger: false` for C2C, `true` for groups
+- **Subsequent C2C (private)**: Auto-registered as `qqbot-{first 8 chars of senderName}` with `requiresTrigger: false`
+- **Subsequent Group**: Auto-registered as `qqbot-{first 8 chars of senderName}` with `requiresTrigger: true`
 
-Folder naming: `qq-{type}-{first 8 chars of OpenID}` (e.g., `qq-c2c-5548dc0b`)
+Folder naming: First chat → `qqbot-main`, others → `qqbot-{shortId}` (e.g., `qqbot-0FB139B7`)
 
 The `onAutoRegister` callback in `index.ts` calls `registerGroup()` which creates the group folder and persists to the database. The message is then delivered normally without needing a restart.
-
-**Optional**: A manual registration tool at `src/channels/register-qqbot.ts` is also available for advanced use (e.g., customizing folder names or trigger patterns):
-
-```bash
-npx tsx src/channels/register-qqbot.ts
-```
 
 ### Step 7: Build and Restart
 
@@ -1220,6 +1220,27 @@ private toUTC(ts: string): string {
 Call `this.toUTC(data.timestamp)` in all message handlers (`handleC2CMessage`, `handleGroupMessage`, `handleChannelMessage`) before passing the timestamp to `onChatMetadata` and `onMessage`.
 
 **Impact**: Without this fix, messages from different timezones may appear out of order in the database, causing the message loop to miss or re-process messages.
+
+#### 7. Token Expiration During Reconnection
+
+**Problem**: After a WebSocket disconnect, `scheduleReconnect()` only called `connectWebSocket()` without refreshing the token first. If the token had expired during the disconnect, the reconnection would fail permanently.
+
+**Solution**: Call `authenticate()` before `connectWebSocket()` in `scheduleReconnect()`, and add retry logic in the catch block:
+
+```typescript
+this.reconnectTimer = setTimeout(async () => {
+  this.reconnectAttempts++;
+  try {
+    await this.authenticate();      // Refresh token first
+    await this.connectWebSocket();
+  } catch (err) {
+    logger.error({ err }, 'QQBot: Reconnection failed');
+    this.scheduleReconnect();       // Retry on failure
+  }
+}, delay);
+```
+
+**Impact**: Without this fix, a token expiration during a disconnect would cause the bot to never reconnect.
 
 ### Bot not connecting
 
